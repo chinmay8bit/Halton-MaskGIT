@@ -1,0 +1,26 @@
+# Core ML libraries
+torch==2.1.0
+torchvision==0.16.0
+
+# Additional dependencies
+packaging==21.3
+torch-fidelity
+torchmetrics
+matplotlib
+seaborn
+opencv-python==4.8.0.74
+tqdm
+pillow
+scikit-learn
+clip
+pytorch-lightning==1.0.8
+omegaconf==2.0.0
+einops==0.3.0
+webdataset
+diffuser
+pycocotools
+transformers
+accelerate
+clean-fid
+gradio
+huggingface_hub
