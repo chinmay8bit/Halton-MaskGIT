@@ -70,7 +70,7 @@ class HaltonScheduler:
         r = max(step + 1, r)
         
         # Construct the mask for the current step
-        _mask = self.halton_mask.clone()[:nb_sample, self.prev_r:r]
+        _mask = self.halton_mask.clone()[:, self.prev_r:r]
         mask = torch.zeros(nb_sample, self.latent_height, self.latent_width, dtype=torch.bool, device=logits.device)
         for i_mask in range(nb_sample):
             mask[i_mask, _mask[i_mask, :, 0], _mask[i_mask, :, 1]] = 1
@@ -154,7 +154,9 @@ class Pipeline:
         
         #4. Set scheduler timesteps
         self.scheduler.set_timesteps(num_inference_steps)
-        self.scheduler.initialize_halton_masks(batch_size, randomize=True)
+        self.scheduler.initialize_halton_masks(num_samples, randomize=True)
+        
+        logits = torch.zeros((*latents.shape, self.codebook_size), device=self._execution_device)
         
         #5. Inference steps
         bar = range(num_inference_steps) if disable_progress_bar else tqdm(range(num_inference_steps), leave=False)
@@ -163,18 +165,19 @@ class Pipeline:
                 #5.1 Get logits
                 batch_latents = latents[batch_size*idx : batch_size*(idx+1)].clone()
                 if unconditional:
-                    logits = self.get_unconditional_logits(batch_latents)
+                    tmp_logits = self.get_unconditional_logits(batch_latents)
                 else:
                     assert labels is not None
                     batch_labels = labels[batch_size*idx : batch_size*(idx+1)]
-                    logits = self.get_logits(batch_latents, batch_labels, guidance_scale)
+                    tmp_logits = self.get_logits(batch_latents, batch_labels, guidance_scale)
+                logits[batch_size*idx : batch_size*(idx+1)] = tmp_logits
                 
-                #5.2 Update latents
-                latents[batch_size*idx : batch_size*(idx+1)] = self.scheduler.sample(
-                    logits,
-                    batch_latents,
-                    i,
-                )
+            #5.2 Update latents
+            latents = self.scheduler.sample(
+                logits,
+                latents,
+                i,
+            )
         
         #6. Decode latents to get images
         images = []
