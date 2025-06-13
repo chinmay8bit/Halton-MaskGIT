@@ -237,8 +237,14 @@ class Transformer(nn.Module):
             nn.init.normal_(self.reg_tokens.weight, std=0.02)
 
     def forward(self, x, y, drop_label, mask=None):
-        b, h, w = x.size()
-        x = x.reshape(b, h*w)
+        is_one_hot = (x.ndim == 4)
+        
+        if is_one_hot:
+            b, h, w, _ = x.size()
+            x = x.reshape(b, h*w, -1)
+        else:
+            b, h, w = x.size()
+            x = x.reshape(b, h*w)
 
         # Drop the label if drop_label
         y = torch.where(drop_label, torch.full_like(y, self.nclass), y)
@@ -247,7 +253,10 @@ class Transformer(nn.Module):
         pos = torch.arange(0, w*h, dtype=torch.long, device=x.device)
         pos = self.pos_emb(pos)
 
-        x = self.tok_emb(x) + pos
+        if is_one_hot:
+            x = (x @ self.tok_emb.weight) + pos
+        else:
+            x = self.tok_emb(x) + pos
 
         # reshape, proj to smaller space, reshape (patchify!)
         if self.proj > 1:
