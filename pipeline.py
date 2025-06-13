@@ -39,14 +39,15 @@ class HaltonScheduler:
     
     def initialize_halton_masks(self, nb_sample, randomize=True):
         # Randomizing the mask sequence if enabled
-            if randomize:
-                randomize_mask = torch.randint(0, self.latent_size, (nb_sample,))
-                self.halton_mask = torch.zeros(nb_sample, self.latent_size, 2, dtype=torch.long)
-                for i_h in range(nb_sample):
-                    rand_halton = torch.roll(self.basic_halton_mask.clone(), randomize_mask[i_h].item(), 0) # type: ignore
-                    self.halton_mask[i_h] = rand_halton
-            else:
-                self.halton_mask = self.basic_halton_mask.clone().unsqueeze(0).expand(nb_sample, self.latent_size, 2)
+        if randomize:
+            randomize_mask = torch.randint(0, self.latent_size, (nb_sample,))
+            self.halton_mask = torch.zeros(nb_sample, self.latent_size, 2, dtype=torch.long)
+            for i_h in range(nb_sample):
+                rand_halton = torch.roll(self.basic_halton_mask.clone(), randomize_mask[i_h].item(), 0) # type: ignore
+                self.halton_mask[i_h] = rand_halton
+        else:
+            self.halton_mask = self.basic_halton_mask.clone().unsqueeze(0).expand(nb_sample, self.latent_size, 2)
+        self.prev_r = 0
     
     def get_temperature(self, step):
         temp = self.temperature[step] ** self.temp_pow
@@ -69,10 +70,11 @@ class HaltonScheduler:
         r = max(step + 1, r)
         
         # Construct the mask for the current step
-        _mask = self.halton_mask.clone()[:nb_sample, :r]
+        _mask = self.halton_mask.clone()[:nb_sample, self.prev_r:r]
         mask = torch.zeros(nb_sample, self.latent_height, self.latent_width, dtype=torch.bool, device=logits.device)
         for i_mask in range(nb_sample):
             mask[i_mask, _mask[i_mask, :, 0], _mask[i_mask, :, 1]] = 1
+        self.prev_r = r
         
         # Choose softmax temperature
         temp = self.get_temperature(step)
