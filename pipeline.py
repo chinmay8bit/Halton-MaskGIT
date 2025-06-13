@@ -107,18 +107,22 @@ class Pipeline:
         vqvae, 
         transformer, 
         scheduler, 
+        codeboook_size: int,
         mask_token_id: int, 
         latent_height: int, 
         latent_width: int, 
         device: torch.device = torch.device('cuda'),
+        use_mixed_precision: bool = False,
     ):
         self.vqvae = vqvae.to(device)
         self.transformer = transformer.to(device)
         self.scheduler = scheduler
+        self.codebook_size = codeboook_size
         self.mask_token_id = mask_token_id
         self.latent_height = latent_height
         self.latent_width = latent_width
         self._execution_device = device
+        self.use_mixed_precision = use_mixed_precision
     
     @torch.no_grad()
     def __call__(
@@ -184,22 +188,26 @@ class Pipeline:
         nb_sample = len(latents)
         drop = torch.ones(nb_sample, dtype=torch.bool).to(self._execution_device)
         dummy_labels = torch.zeros(nb_sample, dtype=torch.long, device=self._execution_device)
-        logits = self.transformer(latents, dummy_labels, drop)
+        with torch.autocast(device_type="cuda", enabled=self.use_mixed_precision):
+            logits = self.transformer(latents, dummy_labels, drop)
+        logits = logits.float()
         logits = logits.view(nb_sample, self.latent_height, self.latent_width, -1)
-        return logits
+        return logits[..., :self.codebook_size]
     
     def get_logits(self, latents, labels, guidance_scale):
         nb_sample = len(latents)
         drop = torch.ones(nb_sample, dtype=torch.bool).to(self._execution_device)
-        logits = self.transformer(
-            torch.cat([latents, latents], dim=0),
-            torch.cat([labels, labels], dim=0),
-            torch.cat([~drop, drop], dim=0)
-        )
+        with torch.autocast(device_type="cuda", enabled=self.use_mixed_precision):
+            logits = self.transformer(
+                torch.cat([latents, latents], dim=0),
+                torch.cat([labels, labels], dim=0),
+                torch.cat([~drop, drop], dim=0)
+            )
+        logits = logits.float()
         logits_c, logits_u = torch.chunk(logits, 2, dim=0)
         logits = (1 + guidance_scale) * logits_c - guidance_scale * logits_u
         logits = logits.view(nb_sample, self.latent_height, self.latent_width, -1)
-        return logits
+        return logits[..., :self.codebook_size]
     
     def decode_latents(self, latents):
         images = self.vqvae.decode_code(latents)

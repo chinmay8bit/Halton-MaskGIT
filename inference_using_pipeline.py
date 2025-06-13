@@ -43,10 +43,12 @@ pipe = Pipeline(
     vqvae=vqvae,
     transformer=transformer,
     scheduler=scheduler,
+    codeboook_size=codebook_size,
     mask_token_id=codebook_size,
     latent_height=input_size,
     latent_width=input_size,
     device=device,
+    use_mixed_precision=True,
 )
 
 num_samples = 16
