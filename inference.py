@@ -39,6 +39,7 @@ labels = None
 gen_images = sampler(trainer=model, nb_sample=16, labels=labels, verbose=True)[0]
 # %%
 show_images_grid(gen_images)
+exit(0)
 
 print(gen_images.shape)
 

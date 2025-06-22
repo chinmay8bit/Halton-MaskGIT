@@ -48,7 +48,7 @@ pipe = Pipeline(
     latent_height=input_size,
     latent_width=input_size,
     device=device,
-    use_mixed_precision=True,
+    use_mixed_precision=False,
 )
 
 num_samples = 16
@@ -59,10 +59,10 @@ labels = [22] * 16
 
 images = pipe(
     num_samples=len(labels),
-    num_inference_steps=32,
+    num_inference_steps=100,
     guidance_scale=2,
     labels=torch.tensor(labels).to(device),
-    unconditional=False,
+    unconditional=True,
 )
 
 def show_images_grid(batch, nrow=4, padding=2):
@@ -83,3 +83,21 @@ def show_images_grid(batch, nrow=4, padding=2):
     plt.show()
 
 show_images_grid(images)
+
+
+from transformers import ViTFeatureExtractor, ViTForImageClassification
+def get_classfier_fn():
+    # Intialize reward models
+    feature_extractor = ViTFeatureExtractor.from_pretrained('google/vit-base-patch32-384')
+    classifier =  ViTForImageClassification.from_pretrained('google/vit-base-patch32-384').to(device) # type: ignore
+    def tmp_fn(images):
+        if feature_extractor.do_normalize:
+            mean = torch.tensor(feature_extractor.image_mean, device=images.device).view(1, 3, 1, 1)
+            std  = torch.tensor(feature_extractor.image_std, device=images.device).view(1, 3, 1, 1)
+            images = (images - mean) / std
+        logits = classifier(images).logits
+        probs = torch.softmax(logits, dim=-1)
+        print(probs.max(dim=-1))
+    return tmp_fn
+classifier_fn = get_classfier_fn()
+classifier_fn(images)

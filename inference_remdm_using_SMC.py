@@ -1,11 +1,11 @@
 import random
 import torch
 
-from transformers import ViTFeatureExtractor, ViTForImageClassification
-
-from pipeline_using_SMC import Pipeline, HaltonScheduler
+from pipeline_remdm_using_SMC import Pipeline, ReMDMScheduler
 from Network.vq_model import VQ_models
 from Network.transformer import Transformer
+
+from plot_utils import show_images_grid
 
 device = torch.device('cuda')
 codebook_size = 16384
@@ -33,6 +33,7 @@ transformer.load_state_dict(checkpoint["model_state_dict"])
 transformer = transformer.eval()
 
 def get_classfier_fn():
+    from transformers import ViTFeatureExtractor, ViTForImageClassification
     # Intialize reward models
     feature_extractor = ViTFeatureExtractor.from_pretrained('google/vit-base-patch32-384')
     classifier =  ViTForImageClassification.from_pretrained('google/vit-base-patch32-384').to(device) # type: ignore
@@ -43,18 +44,16 @@ def get_classfier_fn():
             images = (images - mean) / std
         logits = classifier(images).logits
         logits = torch.log_softmax(logits, dim=-1)
-        return logits[torch.arange(len(labels)), labels]
+        return logits[torch.arange(len(labels)), labels].clamp_max(-0.1)
     return tmp_fn
 classifier_fn = get_classfier_fn()
 
 
-scheduler = HaltonScheduler(
-    latent_height=input_size,
-    latent_width=input_size,
-    sm_temp_min=1,
-    sm_temp_max=1.2,
-    temp_pow=1,
-    temp_warmup=0,
+scheduler = ReMDMScheduler(
+    schedule="cosine",
+    remask_strategy="rescale",
+    eta=1.0,
+    temperature=0.9,
 )
 
 pipe = Pipeline(
@@ -73,10 +72,14 @@ num_samples = 16
 # goldfish, chicken, tiger cat, hourglass, ship, dog, race car, airliner, teddy bear, random
 labels = [1, 7, 282, 604, 724, 179, 751, 404, 850] + [random.randint(0, 999) for _ in range(num_samples - 9)]
 
-num_particles = 9
-batch_p = 3
-labels = [1] * batch_p
-reward_fn = lambda images : classifier_fn(images, torch.tensor(labels).to(device))
+num_particles = 8
+batch_p = 4
+reward_fn = lambda images : classifier_fn(
+    images, 
+    torch.tensor(
+        [1] * len(images)
+    ).to(device)
+)
 
 images = pipe(
     num_inference_steps=100,
@@ -84,27 +87,10 @@ images = pipe(
     # SMC paramters
     num_particles=num_particles,
     batch_p=batch_p,
-    kl_coeff=0.1,
+    kl_coeff=0.2,
     tempering_gamma=0.05,
     reward_fn=reward_fn,
     verbose=True,
 )
 
-def show_images_grid(batch, nrow=4, padding=2):
-    from torchvision.utils import make_grid
-    import matplotlib.pyplot as plt
-
-    # Create the grid
-    grid = make_grid(batch, nrow=nrow, padding=padding)
-
-    # Move the grid to CPU and convert to numpy
-    grid = grid.permute(1, 2, 0).cpu().numpy()
-
-    # Display the grid
-    plt.figure(figsize=(nrow * 2, (len(batch) // nrow + 1) * 2))
-    plt.imshow(grid)
-    plt.axis("off")
-    plt.savefig("output_pipeline_SMC.png")
-    plt.show()
-
-show_images_grid(images)
+show_images_grid(images[:8], save_file="output_SMC.png")

@@ -121,6 +121,9 @@ class HaltonSampler(object):
                                             torch.cat([~drop, drop], dim=0))
                     logit_c, logit_u = torch.chunk(logit, 2, dim=0)
                     logit = (1 + self.w) * logit_c - self.w * logit_u
+                    guidance = logit - logit_u
+                    # print("Approx guidance: ", guidance.flatten(start_dim=1).sum(dim=1).mean())
+                    print("Approx guidance norm: ", ((guidance - guidance.mean(dim=-1, keepdim=True)) ** 2).mean().sqrt())
                 else:
                     with trainer.autocast:
                         logit = trainer.vit(code.clone(), labels, ~drop)

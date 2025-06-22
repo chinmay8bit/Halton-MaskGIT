@@ -5,80 +5,36 @@ import torch
 from tqdm import tqdm
 import torch.nn.functional as F
 
-
-from Sampler.halton_sampler import HaltonSampler
 from smc_utils import compute_ess_from_log_w, resampling_function, adaptive_tempering
+from plot_utils import show_images_grid
 
 
-def sum_masked_logits(
-    logits: torch.Tensor,
-    preds: torch.Tensor,
-    mask: torch.Tensor
-) -> torch.Tensor:
-    """
-    Sum the logits corresponding to the predicted classes at positions where mask is True.
-
-    Args:
-        logits (Tensor): shape (B, H, W, C), model output logits.
-        preds (LongTensor): shape (B, H, W), predicted class indices in [0, C-1].
-        mask (BoolTensor): shape (B, H, W), mask indicating which positions to include.
-
-    Returns:
-        Tensor: a 1D tensor of shape (B,) containing the sum of masked logits per sample.
-    """
-    # 1) Gather the logit at each predicted class
-    pred_logits = logits.gather(dim=-1, index=preds.unsqueeze(-1)).squeeze(-1)
-    # 2) Zero out unmasked positions and sum over spatial dims
-    masked_logits = pred_logits * mask.to(pred_logits.dtype)
-    return masked_logits.sum(dim=(1, 2))
+def assert_one_hot(x):
+    assert ((x == 0) | (x == 1)).all() and (x.sum(dim=-1) == 1).all(), "Tensor is not one-hot"
 
 
-class HaltonScheduler:
+class ReMDMScheduler:
     def __init__(
         self,
-        latent_height: int,
-        latent_width: int,
-        sm_temp_min: float = 1,
-        sm_temp_max: float = 1,
-        temp_pow=1,
-        top_k: int = -1,
-        temp_warmup: int = 0,
+        schedule,
+        remask_strategy,
+        eta,
+        temperature=1.0,
     ):
-        self.latent_height = latent_height
-        self.latent_width = latent_width
-        self.sm_temp_min = sm_temp_min
-        self.sm_temp_max = sm_temp_max
-        self.temp_pow = temp_pow
-        self.top_k = top_k
-        self.temp_warmup_till = temp_warmup
-        
-        assert self.latent_height == self.latent_width
-        self.basic_halton_mask = HaltonSampler.build_halton_mask(self.latent_height)
-        self.latent_size = self.latent_height * self.latent_width
-    
+        self.schedule = schedule
+        self.remask_strategy = remask_strategy
+        self.eta = eta 
+        self.temperature = temperature
+
     def set_timesteps(self, num_inference_steps: int):
         self.num_inference_steps = num_inference_steps
-        # Linearly interpolate the temperature over the sampling steps
-        self.temperature = torch.linspace(self.sm_temp_min, self.sm_temp_max, self.num_inference_steps)
-    
-    def initialize_halton_masks(self, nb_sample, randomize=True):
-        # Randomizing the mask sequence if enabled
-        if randomize:
-            randomize_mask = torch.randint(0, self.latent_size, (nb_sample,))
-            self.halton_mask = torch.zeros(nb_sample, self.latent_size, 2, dtype=torch.long)
-            for i_h in range(nb_sample):
-                rand_halton = torch.roll(self.basic_halton_mask.clone(), randomize_mask[i_h].item(), 0) # type: ignore
-                self.halton_mask[i_h] = rand_halton
+        if self.schedule == "linear":
+            self.alphas = 1 - torch.linspace(0, 1, num_inference_steps + 1)
+        elif self.schedule == "cosine":
+            self.alphas = 1 - torch.cos((torch.pi/2) * (1 - torch.linspace(0, 1, num_inference_steps + 1)))
         else:
-            self.halton_mask = self.basic_halton_mask.clone().unsqueeze(0).expand(nb_sample, self.latent_size, 2)
-        self.prev_r = 0
-    
-    def get_temperature(self, step):
-        temp = self.temperature[step] ** self.temp_pow
-        if step < self.temp_warmup_till:
-            temp *= 0.5  # Reduce temperature during warmup
-        return temp
-    
+            raise ValueError(f"unknown masking schedule {self.schedule}")
+
     def sample_with_approx_guidance(
         self,
         logits: torch.Tensor,
@@ -86,48 +42,70 @@ class HaltonScheduler:
         latents: torch.Tensor,
         step: int,
     ):
-        nb_sample = len(latents)
+        B, H, W, C = logits.shape
+        assert latents.shape == (B, H, W)
         
-        # Compute the number of tokens to predict
-        ratio = ((step + 1) / self.num_inference_steps)
-        r = 1 - (torch.arccos(torch.tensor(ratio)) / (math.pi * 0.5))
-        r = int(r * (self.latent_size))
-        r = max(step + 1, r)
+        logits = logits.reshape(B, H*W, C)
+        approx_guidance = approx_guidance.reshape(B, H*W, C)
+        latents = latents.reshape(B, H*W)
         
-        # Construct the mask for the current step
-        _mask = self.halton_mask.clone()[:, self.prev_r:r]
-        mask = torch.zeros(nb_sample, self.latent_height, self.latent_width, dtype=torch.bool, device=logits.device)
-        for i_mask in range(nb_sample):
-            mask[i_mask, _mask[i_mask, :, 0], _mask[i_mask, :, 1]] = 1
-        self.prev_r = r
+        t = self.num_inference_steps - step
+        s = t - 1
         
-        logits_with_approx_guidance = logits + approx_guidance
+        alpha_t = self.alphas[t]
+        alpha_s = self.alphas[s]
+        sigma_t_max = torch.clamp_max((1 - alpha_s) / alpha_t, 1.0)
+        if self.remask_strategy == "max_cap":
+            sigma_t = torch.clamp_max(sigma_t_max, self.eta)
+        elif self.remask_strategy == "rescale":
+            sigma_t = sigma_t_max * self.eta
+        else:
+            raise ValueError(f"unknown masking schedule {self.remask_strategy}")
         
-        # Choose softmax temperature
-        temp = self.get_temperature(step)
-        
-        # Compute probabilities using softmax
-        prob = torch.softmax(logits_with_approx_guidance * temp, -1)
-        
-        # Sample from the categorical distribution
-        preds = torch.distributions.Categorical(probs=prob).sample()
-        
-        # Update code with new predictions
-        new_latents = torch.where(
-            mask,
-            preds,
-            latents,
+        # z_t != m
+        x_theta = F.one_hot(latents, num_classes=C).float()
+        logits_z_t_neq_m = (
+            torch.log(x_theta) +
+            torch.log(1 - sigma_t)
         )
-        assert (latents[mask] == 16384).all()
+        logits_z_t_neq_m[..., C-1] = (
+            torch.log(sigma_t)
+        )
         
-        # Calculate prob proposal and prob diffusion
-        logits = (logits * temp).log_softmax(dim=-1)
-        logits_with_approx_guidance = (logits_with_approx_guidance * temp).log_softmax(dim=-1)
+        # z_t = m
+        log_x_theta = (logits / self.temperature).log_softmax(dim=-1)
+        logits_z_t_eq_m = (
+            log_x_theta + 
+            torch.log((alpha_s - (1 - sigma_t) * alpha_t) / (1 - alpha_t))
+        )
+        logits_z_t_eq_m[..., C-1] = (
+            torch.log((1 - alpha_s - sigma_t * alpha_t) / (1 - alpha_t))
+        )
         
-        log_prob_proposal = sum_masked_logits(logits_with_approx_guidance, preds, mask)
-        log_prob_diffusion = sum_masked_logits(logits, preds, mask)
+        z_t_neq_m = (latents != C-1)
+        p_theta_logits = torch.where(
+            z_t_neq_m.unsqueeze(-1).expand(-1, -1, C),
+            logits_z_t_neq_m,
+            logits_z_t_eq_m,
+        )
+        assert torch.allclose(torch.exp(p_theta_logits).sum(dim=-1), torch.ones(B, H*W, device=logits.device))
         
+        proposal_logits = (p_theta_logits + approx_guidance).log_softmax(dim=-1)
+        assert torch.allclose(torch.exp(proposal_logits).sum(dim=-1), torch.ones(B, H*W, device=logits.device))
+        
+        proposal_dist = torch.distributions.Categorical(logits=proposal_logits)
+        diffusion_dist = torch.distributions.Categorical(logits=p_theta_logits)
+        
+        new_latents = proposal_dist.sample()
+        
+        log_prob_proposal = proposal_dist.log_prob(new_latents).sum(dim=1)
+        log_prob_diffusion = diffusion_dist.log_prob(new_latents).sum(dim=1)
+        
+        new_latents = new_latents.reshape(B, H, W)
+        
+        print("Unmasked:", (new_latents != C-1).sum(dim=(1, 2)))
         return new_latents, log_prob_proposal, log_prob_diffusion
+
 
 
 class Pipeline:
@@ -185,11 +163,10 @@ class Pipeline:
         
         #4. Set scheduler timesteps
         self.scheduler.set_timesteps(num_inference_steps)
-        self.scheduler.initialize_halton_masks(num_particles, randomize=False)
         
         # Intialize variables for SMC sampler
-        logits = torch.zeros((*latents.shape, self.codebook_size), device=self._execution_device) # type: ignore
-        approx_guidance = torch.zeros((*latents.shape, self.codebook_size), device=self._execution_device) # type: ignore 
+        logits = torch.zeros((*latents.shape, self.codebook_size + 1), device=self._execution_device) # type: ignore
+        approx_guidance = torch.zeros((*latents.shape, self.codebook_size + 1), device=self._execution_device) # type: ignore 
         log_w = torch.zeros(latents.shape[0], device=self._execution_device)
         log_prob_diffusion = torch.zeros(latents.shape[0], device=self._execution_device)
         log_prob_proposal = torch.zeros(latents.shape[0], device=self._execution_device)
@@ -208,6 +185,7 @@ class Pipeline:
         def _calc_guidance():
             assert latents is not None
             if (i >= start):
+                imgs = []
                 for idx in range(math.ceil(num_particles / batch_size)):
                     with torch.enable_grad():
                         latents_one_hot = F.one_hot(
@@ -216,32 +194,44 @@ class Pipeline:
                         ).float().requires_grad_(True)
 
                         tmp_logits = self.get_unconditional_logits(latents_one_hot)
-                
-                        tmp_pred_original_sample: torch.Tensor = self.get_pred_original_sample(
-                            logits=tmp_logits,
-                            sample_one_hot=latents_one_hot,
-                            use_continuous_formualtion=True,
-                        )
                         
-                        tmp_pred_original_sample_decoded = self.decode_one_hot_latents(tmp_pred_original_sample)
+                        M = 1
+                        tmp_rewards = torch.zeros_like(rewards[batch_size*idx : batch_size*(idx+1)])
+
+                        for _ in range(M):
+                            tmp_pred_original_sample: torch.Tensor = self.get_pred_original_sample(
+                                logits=tmp_logits,
+                                sample_one_hot=latents_one_hot,
+                                use_continuous_formualtion=True,
+                            )
+                            
+                            tmp_pred_original_sample_decoded = self.decode_one_hot_latents(tmp_pred_original_sample)
+                            
+                            # Calculate rewards
+                            tmp_rewards += (1/M) * reward_fn(tmp_pred_original_sample_decoded).to(torch.float32) # type: ignore
+                            
+                        if i % 10 == 0:
+                            imgs.append(tmp_pred_original_sample_decoded.detach().cpu())
                         
-                        # Calculate rewards
-                        tmp_rewards = reward_fn(tmp_pred_original_sample_decoded).to(torch.float32) # type: ignore
                         tmp_log_twist_func = lookforward_fn(tmp_rewards).to(torch.float32)
                         
                         # Calculate approximate guidance noise for maximizing reward
                         tmp_approx_guidance = torch.autograd.grad(
-                            outputs=tmp_log_twist_func, 
-                            # inputs=tmp_pred_original_sample,
+                            outputs=tmp_log_twist_func,
                             inputs=latents_one_hot,
                             grad_outputs=torch.ones_like(tmp_log_twist_func)
-                        )[0].detach()[..., :self.codebook_size] # type: ignore
-                        # tmp_approx_guidance = torch.zeros_like(latents_one_hot[..., :self.transformer.config.codebook_size]) # type: ignore
+                        )[0].detach() # type: ignore
+                        
+                        # tmp_approx_guidance *= kl_coeff
+                        tmp_approx_guidance -= tmp_approx_guidance.min(dim=-1, keepdim=True)[0]
                         
                         logits[batch_size*idx : batch_size*(idx+1)] = tmp_logits.detach().clone()
                         rewards[batch_size*idx : batch_size*(idx+1)] = tmp_rewards.detach().clone()
                         log_twist_func[batch_size*idx : batch_size*(idx+1)] = tmp_log_twist_func.detach().clone()
                         approx_guidance[batch_size*idx : batch_size*(idx+1)] = tmp_approx_guidance.clone()
+                
+                if i % 10 == 0:
+                    show_images_grid(torch.cat(imgs, dim=0), save_file=f"output_SMC.png")
                 
                 if torch.isnan(log_twist_func).any():
                     if verbose:
@@ -261,8 +251,7 @@ class Pipeline:
             
             if verbose:
                 print("Expected rewards of proposals: ", rewards)
-                # print("Approx guidance: ", approx_guidance.flatten(start_dim=1).sum(dim=1))
-                print("Approx guidance norm: ", ((approx_guidance - approx_guidance.mean(dim=-1, keepdim=True)) ** 2).mean().sqrt())
+                print("Approx guidance norm: ", (approx_guidance ** 2).mean().sqrt())
         
         
         #5. Inference steps
@@ -316,7 +305,7 @@ class Pipeline:
                     approx_guidance *= min_scale_next
                     
                     if verbose:
-                        print("Approx guidance norm after scale: ", ((approx_guidance - approx_guidance.mean(dim=-1, keepdim=True)) ** 2).mean().sqrt())
+                        print("Approx guidance norm after scale: ", (approx_guidance ** 2).mean().sqrt())
                     
                     ################### Weight & Resample (Importance Sampling) ###################
                     
@@ -413,28 +402,30 @@ class Pipeline:
         batch_size = len(sample_one_hot)
         
         sample_one_hot = sample_one_hot.reshape(batch_size, height * width, vocab_size)
-        logits = logits.reshape(batch_size, height * width, codebook_size)
+        logits = logits.reshape(batch_size, height * width, vocab_size)
 
-        pred_original_sample = F.gumbel_softmax(
+        pred_sample = F.gumbel_softmax(
             logits=logits,
             hard=True,
             dim=-1,
         )
+        pred_original_sample = torch.zeros_like(pred_sample)
         
         if use_continuous_formualtion:
             # Carry Over Unmaksing - continuous formulation
-            pred_original_sample = (
-                pred_original_sample * (1 - sample_one_hot[..., :codebook_size].sum(dim=-1, keepdim=True)) +
+            pred_original_sample[..., :codebook_size] = (
+                pred_sample[..., :codebook_size] * (1 - sample_one_hot[..., :codebook_size].sum(dim=-1, keepdim=True)) +
                 sample_one_hot[..., :codebook_size]
             )
         else:
-            pred_original_sample = torch.where(
+            pred_original_sample[..., :codebook_size] = torch.where(
                 sample_one_hot[..., :codebook_size].sum(dim=-1, keepdim=True) == 0,
-                pred_original_sample,
+                pred_sample[..., :codebook_size],
                 sample_one_hot[..., :codebook_size]
             )
 
-        pred_original_sample = pred_original_sample.reshape(batch_size, height, width, codebook_size)
+        assert_one_hot(pred_original_sample)
+        pred_original_sample = pred_original_sample.reshape(batch_size, height, width, vocab_size)
         return pred_original_sample
                     
     def get_unconditional_logits(self, latents):
@@ -445,15 +436,9 @@ class Pipeline:
             logits = self.transformer(latents, dummy_labels, drop)
         logits = logits.float()
         logits = logits.view(nb_sample, self.latent_height, self.latent_width, -1)
-        return logits[..., :self.codebook_size]
+        logits[..., self.codebook_size] = -torch.inf
+        return logits
 
-    
-    # def decode_latents(self, latents):
-    #     images = self.vqvae.decode_code(latents)
-    #     images = torch.clamp(images, -1, 1)
-    #     images = (images + 1.0) / 2.0
-    #     return images
-    
     def decode_one_hot_latents(self, latents_one_hot):
         # get quantized latent vectors
         if self.vqvae.quantize.l2_norm:
@@ -468,3 +453,4 @@ class Pipeline:
         images = torch.clamp(images, -1, 1)
         images = (images + 1.0) / 2.0
         return images
+

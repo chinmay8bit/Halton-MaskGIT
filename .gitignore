@@ -9,3 +9,5 @@ extract_vq_txt_features.py
 !/.gitignore
 
 venv/
+saved_networks/
+*.png
