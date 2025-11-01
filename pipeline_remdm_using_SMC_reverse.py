@@ -134,8 +134,14 @@ class ReMDMScheduler:
         proposal_dist = torch.distributions.Categorical(logits=proposal_logits)
         diffusion_dist = torch.distributions.Categorical(logits=p_theta_logits)
         
-        new_latents = proposal_dist.sample()
+        n_samples = 10000
+        latent_samples = diffusion_dist.sample((n_samples,)) # shape (n_samples, B, L) 
+        log_probs_proposal = proposal_dist.log_prob(latent_samples).sum(dim=2).T # shape (B, n_samples)
+        log_probs_diffusion = diffusion_dist.log_prob(latent_samples).sum(dim=2).T # shape (B, n_samples)
         
+        _, max_indices = (log_probs_proposal + log_probs_diffusion).max(dim=1)
+        
+        new_latents = latent_samples[max_indices, torch.arange(B)]
         log_prob_proposal = proposal_dist.log_prob(new_latents).sum(dim=1)
         log_prob_diffusion = diffusion_dist.log_prob(new_latents).sum(dim=1)
         
@@ -243,7 +249,7 @@ class Pipeline:
 
                         tmp_logits = self.get_unconditional_logits(latents_one_hot)
                         
-                        M = 12
+                        M = 1
                         tmp_rewards = torch.zeros_like(rewards[batch_size*idx : batch_size*(idx+1)]).unsqueeze(1).repeat(1, M)
 
                         for m_i in range(M):
@@ -265,17 +271,12 @@ class Pipeline:
                         tmp_log_twist_func = logmeanexp(tmp_log_twist_func, dim=1)
                         tmp_rewards = tmp_log_twist_func * kl_coeff
                         
-                        # tmp_log_twist_func = lookforward_fn(tmp_rewards)
-                        
                         # Calculate approximate guidance noise for maximizing reward
                         tmp_approx_guidance = torch.autograd.grad(
                             outputs=tmp_log_twist_func,
                             inputs=latents_one_hot,
                             grad_outputs=torch.ones_like(tmp_log_twist_func)
                         )[0].detach() # type: ignore
-                        
-                        # tmp_approx_guidance *= kl_coeff
-                        # tmp_approx_guidance -= tmp_approx_guidance.min(dim=-1, keepdim=True)[0]
                         
                         logits[batch_size*idx : batch_size*(idx+1)] = tmp_logits.detach().clone()
                         rewards[batch_size*idx : batch_size*(idx+1)] = tmp_rewards.detach().clone()
@@ -369,7 +370,8 @@ class Pipeline:
                     ################### Weight & Resample (Importance Sampling) ###################
                     
                     # Calculate weights for samples from proposal distribution
-                    incremental_log_w = log_prob_diffusion + log_twist_func - log_prob_proposal - log_twist_func_prev
+                    # incremental_log_w = log_prob_diffusion + log_twist_func - log_prob_proposal - log_twist_func_prev
+                    incremental_log_w = log_twist_func - log_twist_func_prev
                     
                     log_w += incremental_log_w.detach()
 

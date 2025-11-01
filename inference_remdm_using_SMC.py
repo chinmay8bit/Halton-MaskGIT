@@ -1,7 +1,9 @@
 import random
 import torch
 
-from pipeline_remdm_using_SMC import Pipeline, ReMDMScheduler
+# from pipeline_remdm_using_SMC import Pipeline, ReMDMScheduler
+# from pipeline_remdm_using_SMC_hessian import Pipeline, ReMDMScheduler
+from pipeline_remdm_using_SMC_reverse import Pipeline, ReMDMScheduler
 from Network.vq_model import VQ_models
 from Network.transformer import Transformer
 
@@ -44,7 +46,7 @@ def get_classfier_fn():
             images = (images - mean) / std
         logits = classifier(images).logits
         logits = torch.log_softmax(logits, dim=-1)
-        return logits[torch.arange(len(labels)), labels].clamp_max(-0.1)
+        return logits[torch.arange(len(labels)), labels].clamp_max(-0.0)
     return tmp_fn
 classifier_fn = get_classfier_fn()
 
@@ -52,7 +54,7 @@ classifier_fn = get_classfier_fn()
 scheduler = ReMDMScheduler(
     schedule="cosine",
     remask_strategy="rescale",
-    eta=1.0,
+    eta=0.2,
     temperature=0.9,
 )
 
@@ -81,16 +83,17 @@ reward_fn = lambda images : classifier_fn(
     ).to(device)
 )
 
-images = pipe(
+images, _ = pipe(
     num_inference_steps=100,
     disable_progress_bar=True,
     # SMC paramters
     num_particles=num_particles,
     batch_p=batch_p,
-    kl_coeff=0.2,
+    kl_coeff=0.5,
     tempering_gamma=0.05,
     reward_fn=reward_fn,
     verbose=True,
+    # ess_threshold=0,
 )
 
 show_images_grid(images[:8], save_file="output_SMC.png")

@@ -9,7 +9,7 @@ from plot_utils import show_images_grid
 
 device = torch.device('cuda')
 codebook_size = 16384
-img_size = 384
+img_size = 256
 vae_scale_factor = 16
 input_size = img_size // vae_scale_factor
 

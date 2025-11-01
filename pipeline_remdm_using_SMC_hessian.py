@@ -205,7 +205,8 @@ class Pipeline:
         # Intialize variables for SMC sampler
         logits = torch.zeros((*latents.shape, self.codebook_size + 1), device=self._execution_device) # type: ignore
         approx_guidance = torch.zeros((*latents.shape, self.codebook_size + 1), device=self._execution_device) # type: ignore 
-        unscaled_approx_guidance = torch.zeros((*latents.shape, self.codebook_size + 1), device=self._execution_device) # type: ignore 
+        grad_g = torch.zeros((*latents.shape, self.codebook_size + 1), device=self._execution_device) # type: ignore 
+        grad_h = torch.zeros((*latents.shape, self.codebook_size + 1), device=self._execution_device) # type: ignore 
         log_w = torch.zeros(latents.shape[0], device=self._execution_device)
         log_prob_diffusion = torch.zeros(latents.shape[0], device=self._execution_device)
         log_prob_proposal = torch.zeros(latents.shape[0], device=self._execution_device)
@@ -226,11 +227,12 @@ class Pipeline:
         
         def _calc_guidance():
             assert latents is not None
+            z_s = F.one_hot(latents, num_classes=self.codebook_size + 1)
+            z_t = F.one_hot(prev_latents, num_classes=self.codebook_size + 1)
             predicted_rewards = (
-                rewards + (
-                    (F.one_hot(latents, num_classes=self.codebook_size + 1) - F.one_hot(prev_latents, num_classes=self.codebook_size + 1))
-                    * unscaled_approx_guidance
-                ).flatten(start_dim=1).sum(dim=1)
+                rewards + 
+                (grad_g * (z_s - z_t)).flatten(start_dim=1).sum(dim=1) +
+                (0.5 * grad_h * (z_s - z_t) ** 2).flatten(start_dim=1).sum(dim=1)
             )
             if (i >= start):
                 imgs = []
@@ -243,49 +245,60 @@ class Pipeline:
 
                         tmp_logits = self.get_unconditional_logits(latents_one_hot)
                         
-                        M = 12
-                        tmp_rewards = torch.zeros_like(rewards[batch_size*idx : batch_size*(idx+1)]).unsqueeze(1).repeat(1, M)
+                        tmp_rewards = torch.zeros_like(rewards[batch_size*idx : batch_size*(idx+1)])
 
-                        for m_i in range(M):
-                            tmp_pred_original_sample: torch.Tensor = self.get_pred_original_sample(
-                                logits=tmp_logits,
-                                sample_one_hot=latents_one_hot,
-                                use_continuous_formualtion=True,
-                            )
-                            
-                            tmp_pred_original_sample_decoded = self.decode_one_hot_latents(tmp_pred_original_sample)
-                            
-                            # Calculate rewards
-                            tmp_rewards[:, m_i] = reward_fn(tmp_pred_original_sample_decoded).to(torch.float32) # type: ignore
+                        tmp_pred_original_sample: torch.Tensor = self.get_pred_original_sample(
+                            logits=tmp_logits,
+                            sample_one_hot=latents_one_hot,
+                            use_continuous_formualtion=True,
+                        )
+                        
+                        tmp_pred_original_sample_decoded = self.decode_one_hot_latents(tmp_pred_original_sample)
+                        
+                        # Calculate rewards
+                        tmp_rewards = reward_fn(tmp_pred_original_sample_decoded).to(torch.float32) # type: ignore
                             
                         imgs.append(tmp_pred_original_sample_decoded.detach().cpu())
                         
                         tmp_log_twist_func = lookforward_fn(tmp_rewards).to(torch.float32)
                         
-                        tmp_log_twist_func = logmeanexp(tmp_log_twist_func, dim=1)
-                        tmp_rewards = tmp_log_twist_func * kl_coeff
-                        
-                        # tmp_log_twist_func = lookforward_fn(tmp_rewards)
-                        
                         # Calculate approximate guidance noise for maximizing reward
                         tmp_approx_guidance = torch.autograd.grad(
                             outputs=tmp_log_twist_func,
                             inputs=latents_one_hot,
-                            grad_outputs=torch.ones_like(tmp_log_twist_func)
-                        )[0].detach() # type: ignore
+                            grad_outputs=torch.ones_like(tmp_log_twist_func),
+                            create_graph=True,
+                        )[0] # type: ignore
                         
-                        # tmp_approx_guidance *= kl_coeff
-                        # tmp_approx_guidance -= tmp_approx_guidance.min(dim=-1, keepdim=True)[0]
+                        # Hessian computation
+                        diag_hessian = torch.zeros_like(tmp_approx_guidance)
+                        mc_num = 10
+                        for m_i in range(mc_num):
+                            v = torch.bernoulli(torch.ones_like(diag_hessian)*0.5) * 2 - 1
+                            Sv = (tmp_approx_guidance * v).flatten(start_dim=1).sum(dim=1)
+                            Hv = torch.autograd.grad(
+                                outputs=Sv,
+                                inputs=latents_one_hot,
+                                grad_outputs=torch.ones_like(Sv),
+                                retain_graph=True if m_i < mc_num - 1 else False,
+                            )[0]
+                            diag_hessian += (v * Hv).detach()
+                        diag_hessian = diag_hessian / mc_num
                         
                         logits[batch_size*idx : batch_size*(idx+1)] = tmp_logits.detach().clone()
                         rewards[batch_size*idx : batch_size*(idx+1)] = tmp_rewards.detach().clone()
                         log_twist_func[batch_size*idx : batch_size*(idx+1)] = tmp_log_twist_func.detach().clone()
-                        approx_guidance[batch_size*idx : batch_size*(idx+1)] = tmp_approx_guidance.clone()
+                        approx_guidance[batch_size*idx : batch_size*(idx+1)] = (
+                            tmp_approx_guidance +
+                            0.5 * diag_hessian -
+                            diag_hessian * latents_one_hot
+                        ).detach().clone()
+                        grad_g[batch_size*idx : batch_size*(idx+1)] = tmp_approx_guidance.detach().clone() * kl_coeff
+                        grad_h[batch_size*idx : batch_size*(idx+1)] = diag_hessian.detach().clone() * kl_coeff
                 
                 show_images_grid(torch.cat(imgs, dim=0), save_file=f"output_SMC.png")
-                if i%5 == 0:
-                    plot_histogram(approx_guidance.cpu(), save_file=f"approx_guidance_{i}.png")
-                # approx_guidance.clamp_max_(5.0)
+                # if i%5 == 0:
+                #     plot_histogram(approx_guidance.cpu(), save_file=f"approx_guidance_{i}.png")
                 
                 if torch.isnan(log_twist_func).any():
                     if verbose:
@@ -302,8 +315,7 @@ class Pipeline:
                     tmp_logits = self.get_unconditional_logits(batch_latents)
                         
                     logits[batch_size*idx : batch_size*(idx+1)] = tmp_logits.detach().clone()
-                    
-            unscaled_approx_guidance[:] = approx_guidance.clone() * kl_coeff
+
             rewards_trace.append(rewards.mean().cpu())
             approximation_errors.append((rewards - predicted_rewards).mean().cpu())
             
@@ -322,7 +334,8 @@ class Pipeline:
                     
             log_twist_func_prev = log_twist_func.clone() # Used to calculate weight later
             
-            _calc_guidance()
+            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
+                _calc_guidance()
             
             with torch.no_grad():
                 if i >= start:
@@ -395,7 +408,8 @@ class Pipeline:
                     latents = latents[resample_indices] # type: ignore
                     logits = logits[resample_indices]
                     approx_guidance = approx_guidance[resample_indices]
-                    unscaled_approx_guidance = unscaled_approx_guidance[resample_indices]
+                    grad_g = grad_g[resample_indices]
+                    grad_h = grad_h[resample_indices]
                     rewards = rewards[resample_indices]
                     log_twist_func = log_twist_func[resample_indices]
                     
@@ -472,7 +486,7 @@ class Pipeline:
             logits=logits,
             hard=True,
             dim=-1,
-            tau=self.scheduler.temperature,
+            # tau=0.1,
         )
         pred_original_sample = torch.zeros_like(pred_sample)
         
@@ -498,7 +512,7 @@ class Pipeline:
         drop = torch.ones(nb_sample, dtype=torch.bool).to(self._execution_device)
         dummy_labels = torch.zeros(nb_sample, dtype=torch.long, device=self._execution_device)
         with torch.autocast(device_type="cuda", enabled=self.use_mixed_precision):
-            logits = self.transformer(latents, dummy_labels, drop)
+                logits = self.transformer(latents, dummy_labels, drop)
         logits = logits.float()
         logits = logits.view(nb_sample, self.latent_height, self.latent_width, -1)
         logits[..., self.codebook_size] = -torch.inf
